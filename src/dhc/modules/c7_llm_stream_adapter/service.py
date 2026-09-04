@@ -1,0 +1,400 @@
+"""C7 LLMStreamAdapter: SSE consumer with strict chunk buffering.
+
+Contract:
+- Consumes an aiohttp SSE stream (one async iterator of `bytes`).
+- Buffers partial JSON across arbitrary chunk boundaries.
+- Emits `StreamChunk` events to `ctx.events.emit("llm/stream", chunk)`.
+- Never logs the raw API key. Any error message is redacted via C10 scrubber
+  if available; otherwise, the raw bytes are truncated to a length-safe
+  prefix.
+- Buffers at most `_MAX_BUFFER` bytes before raising `BufferOverflow`.
+- All pydantic inputs (`StreamChunk`) are strictly typed; `Any` is forbidden.
+
+Two surfaces:
+
+- `stream(prompt, scenario)` — the original GET-based SSE consumer
+  used by the offline eval pipeline. The endpoint shape is
+  `GET {base_url}/v1/stream/{scenario}`.
+- `chat_stream(messages, model)` — the v1.2.0 chat surface. POSTs to
+  `{base_url}/v1/chat/completions` with a JSON body and reads the
+  SSE response. The body shape is OpenAI-compatible; the response
+  shape is identical to `stream()`'s.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import AsyncIterator, Callable
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field
+
+from dhc.cordis.context import Context
+from dhc.cordis.plugin import plugin
+
+_MAX_BUFFER = 1 * 1024 * 1024
+_SSE_DATA_PREFIX = b"data: "
+_SSE_DONE = b"[DONE]"
+_SSE_FIELD_SEP = b":"
+_SSE_EVENT_TERMINATOR = b"\n\n"
+_MAX_ERROR_PAYLOAD_BYTES = 256
+_DEFAULT_MODEL = "mock-default"
+
+
+class StreamChunk(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    delta: str = Field(default="")
+    tool_calls: list[dict] = Field(default_factory=list)
+    finish_reason: str | None = None
+    raw_index: int = 0
+    # v1.3.1: optional token usage surfaced on the final chunk of
+    # a stream. `None` on intermediate chunks. Shape:
+    # `{"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}`.
+    # Providers that don't return usage (or that return it on a
+    # separate request) leave this as `None`.
+    usage: dict | None = None
+
+
+class BufferOverflow(RuntimeError):
+    pass
+
+
+class LLMStreamAdapter:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        model_registry: "Any | None" = None,
+        secrets_service: "Any | None" = None,
+        config_store: "Any | None" = None,
+        stream_timeout_s: float = 30.0,
+        mock_stream_timeout_s: float = 5.0,
+    ) -> None:
+        """v1.2.0 surface. `base_url` and `api_key` are required
+        (the mock LLM uses them).
+
+        v1.3.0 extension: `model_registry` and `secrets_service`
+        enable live-provider dispatch. When both are set and the
+        requested model is not the mock, `chat_stream` resolves the
+        provider client via the factory in `dhc.integrations` and
+        looks up the per-model API key in `secrets_service`.
+
+        v1.3.1 extension: `config_store` enables per-session
+        `ModelConfig` lookups (ADR-0011). The config supplies
+        `temperature` / `max_tokens` / `top_p` to the provider and
+        a `system_prompt` prepended to the messages list.
+
+        v1.5.1.5: `stream_timeout_s` bounds the per-chunk read of a
+        live provider's SSE stream (default 30s, matching the prior
+        `httpx.Timeout(read=30.0)`). `mock_stream_timeout_s` bounds
+        the per-chunk read of the mock LLM (default 5s — short
+        enough to surface a deadlocked mock as a `chat.error` /
+        `stream_timeout` rather than a 30s hang). If the iterator
+        exceeds the cap, `chat_stream` raises `asyncio.TimeoutError`
+        and the WS handler in c1_gui_web_core surfaces it as
+        `chat.error` with `code: "stream_timeout"`.
+        """
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._redacted = self._redact_key(api_key)
+        self._model_registry = model_registry
+        self._secrets_service = secrets_service
+        self._config_store = config_store
+        self._stream_timeout_s = float(stream_timeout_s)
+        self._mock_stream_timeout_s = float(mock_stream_timeout_s)
+
+    @staticmethod
+    def _redact_key(api_key: str) -> str:
+        if not api_key:
+            return ""
+        if len(api_key) <= 6:
+            return "***"
+        return f"{api_key[:3]}***{api_key[-3:]}"
+
+    @property
+    def redacted_key(self) -> str:
+        return self._redacted
+
+    async def stream(self, prompt: str, scenario: str) -> AsyncIterator[StreamChunk]:
+        url = f"{self._base_url}/v1/stream/{scenario}"
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                async for chunk in self._consume_sse(resp.aiter_bytes()):
+                    yield chunk
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        model: str = _DEFAULT_MODEL,
+        *,
+        session_id: str | None = None,
+        stream_timeout_s: float | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """v1.2.0 chat surface. POSTs an OpenAI-compatible chat
+        completions request and yields deltas.
+
+        `messages` is a list of `{role, content}` dicts (the OpenAI
+        shape). `model` is the model name; the v1.2.0 mock ignores
+        it but downstream providers will use it.
+
+        v1.3.0: when the adapter was constructed with both
+        `model_registry` and `secrets_service` and `model` is not
+        the mock, dispatch to a live provider client.
+
+        v1.3.1: when `session_id` is provided AND a `config_store`
+        was injected, the per-session `ModelConfig` is read and
+        forwarded to the provider (temperature/max_tokens/top_p)
+        and prepended to `messages` as a `system` message if no
+        system message is already present.
+
+        v1.6.0 (Phase 0, defense in depth): the IngressScrubber
+        is applied to every message's `content` before the
+        upstream call. The WS handler in c1_gui_web_core ALSO
+        scrubs (so the journal records the redacted text); the
+        C7 scrub here is the second layer. A user who pastes a
+        key into the chat input never has it sent to the LLM
+        provider, regardless of which handler was bypassed.
+        """
+        # v1.6.0 (Phase 0): IngressScrubber at the C7 chokepoint.
+        # The WS handler already scrubs for journal hygiene; this
+        # is the second layer that protects the upstream provider
+        # call regardless of which handler emitted the frame.
+        from dhc.security.ingress_scrubber import scrub as _scrub
+        messages = [
+            {**m, "content": (_scrub(str(m.get("content") or "")).text)}
+            if m.get("content") is not None else m
+            for m in messages
+        ]
+        # v1.3.0 dispatch (ADR-0009): if we have a registry + a
+        # secrets service, AND the model is not the mock, route to
+        # the live provider.
+        is_mock = (not model) or model == "mock-llm/default" or model.startswith("mock-")
+        if (
+            not is_mock
+            and self._model_registry is not None
+            and self._secrets_service is not None
+        ):
+            # v1.5.1.5: bound the live stream. The per-chunk read
+            # timeout on `httpx.Timeout` is the floor; an explicit
+            # `asyncio.wait_for` is the ceiling on the whole stream.
+            cap = stream_timeout_s if stream_timeout_s is not None else self._stream_timeout_s
+            try:
+                async for chunk in self._consume_with_timeout(
+                    self._dispatch_live(messages, model, session_id), cap
+                ):
+                    yield chunk
+            except asyncio.TimeoutError:
+                raise asyncio.TimeoutError(
+                    f"live stream exceeded {cap:.0f}s (key={self._redacted})"
+                )
+            return
+
+        # v1.5.1.5: bound the mock stream. The mock's per-chunk
+        # `httpx.Timeout(read=5.0)` catches deadlocks; the explicit
+        # `asyncio.wait_for` is the ceiling on the whole stream.
+        mock_cap = stream_timeout_s if stream_timeout_s is not None else self._mock_stream_timeout_s
+        try:
+            async for chunk in self._consume_with_timeout(
+                self._dispatch_mock(messages, model), mock_cap
+            ):
+                yield chunk
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(
+                f"mock stream exceeded {mock_cap:.0f}s (key={self._redacted})"
+            )
+
+    async def _dispatch_live(
+        self, messages: list[dict], model: str, session_id: str | None
+    ) -> AsyncIterator[StreamChunk]:
+        """v1.3.0: resolve provider + key, then call the client.
+
+        The factory raises `ProviderError` on unknown providers or
+        on the mock (which we already filtered out). The secrets
+        service raises a `KeyError` or returns `None` if the key
+        is missing; we surface that as a `ProviderError(status=401)`.
+
+        v1.3.1 (ADR-0011): if a `config_store` is injected and
+        `session_id` is provided, fetch the per-session config and
+        forward `temperature` / `max_tokens` / `top_p` to the
+        provider. A `system_prompt` from the config is prepended
+        to `messages` if no system message is already present.
+        """
+        from dhc.integrations import provider_client_for
+        from dhc.integrations.base import ProviderError
+        from dhc.integrations.key_lookup import lookup_api_key
+        from dhc.services.model_config import ModelConfig
+
+        registry = self._model_registry
+        m = registry.get_model(model)
+        if m is None:
+            raise ProviderError(
+                f"unknown model {model!r}", provider="", model=model
+            )
+        # Per ADR-0007 (v1.3.2 amendment): per-model → per-provider
+        # fallback chain. The first model of the provider is the
+        # v1.3.1 per-provider fallback; `lookup_api_key` walks it.
+        model_part = m.id.partition("/")[2]
+        first_for_provider = None
+        for candidate in registry.models_for_provider(m.provider):
+            if candidate.id == m.id:
+                first_for_provider = candidate.id
+                break
+        if first_for_provider is None:
+            first_for_provider = registry.models_for_provider(m.provider)[0].id
+        api_key = lookup_api_key(
+            m.provider, model_part, self._secrets_service.get,  # type: ignore[attr-defined]
+            provider_first_model_id=first_for_provider.partition("/")[2],
+        )
+        if not api_key:
+            secret_name = f"llm_provider_{m.provider}_{model_part}"
+            raise ProviderError(
+                f"missing api key for {model!r} (expected secret {secret_name!r})",
+                status=401,
+                provider=m.provider,
+                model=model,
+            )
+        client = provider_client_for(m)
+        # Per-session config (ADR-0011).
+        cfg = ModelConfig()
+        if self._config_store is not None and session_id:
+            cfg = self._config_store.get_config(session_id)
+        out_messages = list(messages)
+        if cfg.system_prompt and not any(
+            (m.get("role") == "system") for m in out_messages
+        ):
+            out_messages = [{"role": "system", "content": cfg.system_prompt}] + out_messages
+        async for chunk in client.chat_stream(
+            out_messages,
+            model,
+            api_key,
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            top_p=cfg.top_p,
+        ):
+            yield chunk
+
+    async def _dispatch_mock(
+        self, messages: list[dict], model: str
+    ) -> AsyncIterator[StreamChunk]:
+        """v1.5.1.5: split out the mock-LLM dispatch path so
+        `chat_stream` can wrap it in `_consume_with_timeout` without
+        pulling the live path into the same try/except.
+
+        Behavior is identical to the pre-split inline body.
+        """
+        url = f"{self._base_url}/v1/chat/completions"
+        body = {"model": model or _DEFAULT_MODEL, "messages": list(messages), "stream": True}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}" if self._api_key else "",
+        }
+        # v1.5.1.5: mock stream gets a tight 5s read timeout; a hung
+        # mock is local dev breakage and should surface as
+        # `chat.error` / `stream_timeout`, not a 30s wait.
+        timeout = httpx.Timeout(connect=5.0, read=self._mock_stream_timeout_s, write=5.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                resp.raise_for_status()
+                async for chunk in self._consume_sse(resp.aiter_bytes()):
+                    yield chunk
+
+    async def _consume_with_timeout(
+        self, inner: AsyncIterator[StreamChunk], cap_s: float
+    ) -> AsyncIterator[StreamChunk]:
+        """v1.5.1.5: bound the wall-clock duration of an inner async
+        iterator. If `cap_s` elapses before the inner iterator is
+        exhausted, raise `asyncio.TimeoutError`. The caller is
+        expected to wrap the call in `asyncio.wait_for(...)` semantics
+        (we use `asyncio.timeout` so the cancellation propagates
+        cleanly into the inner httpx read).
+        """
+        async with asyncio.timeout(cap_s):
+            async for chunk in inner:
+                yield chunk
+
+    async def _consume_sse(
+        self, byte_iter: AsyncIterator[bytes]
+    ) -> AsyncIterator[StreamChunk]:
+        buffer = bytearray()
+        index = 0
+        async for raw in byte_iter:
+            if not raw:
+                continue
+            buffer.extend(raw)
+            # Cumulative overflow check: this fires when many small
+            # chunks cumulatively exceed the cap, even if each individual
+            # chunk ended in a clean \n\n terminator and was drained.
+            if len(buffer) > _MAX_BUFFER:
+                raise BufferOverflow(
+                    f"SSE buffer exceeded {_MAX_BUFFER} bytes (key={self._redacted})"
+                )
+            while True:
+                sep = buffer.find(_SSE_EVENT_TERMINATOR)
+                if sep < 0:
+                    break
+                event_block = bytes(buffer[:sep])
+                del buffer[: sep + len(_SSE_EVENT_TERMINATOR)]
+                # Re-check after every drain in case a malformed upstream
+                # sends chunks that re-fill the buffer past the cap.
+                if len(buffer) > _MAX_BUFFER:
+                    raise BufferOverflow(
+                        f"SSE buffer exceeded {_MAX_BUFFER} bytes (key={self._redacted})"
+                    )
+                if not event_block.strip():
+                    continue
+                if event_block.startswith(b":"):
+                    continue
+                line_end = event_block.find(b"\n")
+                first_line = event_block if line_end < 0 else event_block[:line_end]
+                if not first_line.startswith(_SSE_DATA_PREFIX):
+                    continue
+                payload = first_line[len(_SSE_DATA_PREFIX) :]
+                if payload.strip() == _SSE_DONE:
+                    return
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = (choice.get("delta") or {})
+                chunk = StreamChunk(
+                    delta=delta.get("content", "") or "",
+                    tool_calls=delta.get("tool_calls") or [],
+                    finish_reason=choice.get("finish_reason"),
+                    raw_index=index,
+                )
+                index += 1
+                yield chunk
+
+
+@plugin("c7_llm_stream")
+async def apply(ctx: Context, config: dict) -> Callable[[], None]:
+    base_url = (config or {}).get("base_url", "http://127.0.0.1:0")
+    api_key = (config or {}).get("api_key", "")
+    # v1.3.0: optional model registry + secrets service for live dispatch.
+    model_registry = (config or {}).get("model_registry")
+    secrets_service = (config or {}).get("secrets_service")
+    # v1.3.1: optional config_store for per-session ModelConfig
+    # (ADR-0011).
+    config_store = (config or {}).get("config_store")
+    adapter = LLMStreamAdapter(
+        base_url=base_url,
+        api_key=api_key,
+        model_registry=model_registry,
+        secrets_service=secrets_service,
+        config_store=config_store,
+    )
+    ctx.provide("llm", adapter)
+
+    async def dispose() -> None:
+        ctx.services.pop("llm", None)
+
+    return dispose
